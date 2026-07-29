@@ -1,0 +1,88 @@
+# project_plass.
+#核心思路：渐近层查询，查询背压与限流，上下文内存GC，查询看门狗，回答降级。
+#说白了就是靠内核
+#低负载(30%):  raw=5.90  threshold=6.0  freq_w=0.15  ← 阈值翻倍，防误报
+#正常(100%):   raw=6.74  threshold=6.0  freq_w=0.15
+#高峰(250%):   raw=7.05  threshold=6.0  freq_w=0.15
+#浪涌(400%):   raw=7.17  threshold=6.0  freq_w=0.15  ← 评分梯度递增
+'''''''
+CPU 飙升                      内存压力                    进程卡死
+       │                             │                          │
+       ▼                             ▼                          ▼
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+│ DynamicSampler│ → │BackpressureGuard│ → │ MemoryGuard  │ → │  Watchdog    │ → │GracefulDegrader│
+│ CPU感知采样率 │   │ perf buffer背压│   │ 内存双限制   │   │ 30s心跳监控  │   │ 4级优雅降级  │
+├──────────────┤   ├──────────────┤   ├──────────────┤   ├──────────────┤   ├──────────────┤
+│ CPU<30%:100% │   │ 队列>5K:限流  │   │ 软限200M:GC  │   │ 超时→紧急回调│   │ FULL:7维     │
+│ 30-60%: 70% │   │ P99>500ms:   │   │ 硬限500M:    │   │ →保存基线    │   │ REDUCED:5维  │
+│ 60-80%: 40% │   │   紧急降级    │   │   紧急降级    │   │ →优雅退出    │   │ MINIMAL:3维  │
+│ 80-95%: 10% │   │              │   │ 泄漏检测60s  │   │              │   │ EMERGENCY:   │
+│ >95%:   5%  │   │              │   │              │   │              │   │   仅规则过滤  │
+└──────────────┘   └──────────────┘   └──────────────┘   └──────────────┘   └──────────────┘
+      │                  │                  │                  │                  │
+      └──────────────────┴──────────────────┴──────────────────┴──────────────────┘
+                                       │
+                                  GuardianProtector 门面
+                                  (2s 保护轮询线程)
+'''''''
+''''''''
+场景1  www-data 正常 Web     1.24    ✅ 正常
+场景3  root 正常配置管理      2.01    ✅ 正常  
+场景5  dev 正常操作 home      2.43    ✅ 正常
+场景8  www-data 正常日志      3.46    ⚠️ (LOG训练少，调参可解)
+──────────────────────────────────────────
+场景7  TEMP 风暴             3.33    ✅ 文件上下文告警
+场景10 www-data 反弹 Shell    5.35    ✅ 用户+序列+文件三重告警
+场景11 混合隐蔽攻击           5.87    ✅ 10%异常混入被检出
+场景9  非工作时间可疑活动      5.66    ✅ 时间分段告警
+──────────────────────────────────────────
+场景2  www-data 越权 /etc    2.50    ⚠️ (用户分布相似，真实环境差异大)
+场景4  root 从 /tmp 执行      2.61    ⚠️ (同上)
+场景6  未知 UID 敏感文件      2.38    ⚠️ (未知UID仅给2.0加分)
+''''''''
+#基础部署
+sudo bash install.sh --modules core,protector
+
+# 场景2: 完整部署
+sudo bash install.sh
+
+# 场景3: 升级规则配置
+sudo bash install.sh --modules rules
+
+# 场景4: 卸载
+sudo bash install.sh --uninstall
+
+CLI 管理
+guardianctl status     # 进程状态+CPU/内存+模块清单
+guardianctl health     # 4项健康检查（Python组件/保护模块/eBPF/配置）
+guardianctl test       # 全组件自检
+guardianctl stats      # 最近1小时告警统计
+guardianctl dump       # 导出基线模型
+guardianctl logs -f    # 实时日志
+
+systemd 守护
+Restart=on-failure     # 崩溃自动重启
+WatchdogSec=30s        # 系统级看门狗
+MemoryMax=800M         # 硬内存限制
+CPUQuota=200%          # CPU 限制
+ProtectSystem=strict   # 安全加固
+
+项目文件总览
+runtime-guardian/
+├── Makefile                    (8KB)  构建系统
+├── VERSION                           版本号
+├── src/
+│   ├── ebpf_monitor.py        (1115行) eBPF监控引擎
+│   ├── baseline_detector.py   (1900行) 七维基线检测
+│   ├── guardian_protector.py  (691行)  5层防死机保护
+│   └── responder.py           (1435行) 自动响应
+├── config/rules.yaml          (795行)  完整规则配置
+├── scripts/
+│   ├── install.sh             (480行)  企业级安装脚本
+│   └── guardianctl.sh         (380行)  CLI管理工具
+├── deploy/
+│   └── runtime-guardian.service        systemd服务
+├── docs/                              学习路线+鸿蒙分析
+├── tests/simulate_attacks.sh          攻击模拟
+└── dist/packages/               ← 分发包输出目录
+''''''''
