@@ -1,0 +1,64 @@
+[Unit]
+Description=Runtime Guardian — eBPF Runtime Vulnerability Detection
+Documentation=https://github.com/runtime-guardian
+After=network.target local-fs.target
+Wants=network.target
+
+# 仅在满足以下条件时启动
+ConditionPathExists=/usr/local/lib/runtime-guardian/ebpf_monitor.py
+ConditionVirtualization=!container
+
+[Service]
+Type=simple
+
+# 运行时用户
+User=root
+Group=root
+
+# 工作目录
+WorkingDirectory=/usr/local/lib/runtime-guardian
+
+# 启动命令
+ExecStartPre=/usr/bin/python3 -c "from bcc import BPF; print('eBPF ready')"
+ExecStart=/usr/bin/python3 /usr/local/lib/runtime-guardian/ebpf_monitor.py \
+    --rules /etc/runtime-guardian/rules.yaml \
+    --baseline /var/lib/runtime-guardian/baseline_model.json
+
+# 重启策略
+Restart=on-failure
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# 看门狗集成 (systemd watchdog)
+WatchdogSec=30s
+
+# 安全加固
+NoNewPrivileges=no
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/runtime-guardian /var/log/runtime-guardian /var/run/runtime-guardian
+ReadOnlyPaths=/etc/runtime-guardian
+ProtectKernelTunables=yes
+ProtectKernelModules=no
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+MemoryHigh=500M
+MemoryMax=800M
+CPUQuota=200%
+TasksMax=512
+
+# 日志
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=runtime-guardian
+
+# 资源限制
+LimitNOFILE=65536
+LimitNPROC=4096
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target

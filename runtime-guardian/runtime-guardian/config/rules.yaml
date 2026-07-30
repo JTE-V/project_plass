@@ -1,0 +1,795 @@
+# ==============================================================================
+# Runtime Guardian — 检测规则与响应策略配置
+# ==============================================================================
+# 本文件定义监控器的核心检测规则、阈值、行为链模式、响应策略和白名单。
+# 所有检测模块（eBPF 探针 + 用户态分析）均从此读取配置。
+#
+# 配置热加载: 修改此文件后向监控器发送 SIGHUP 即可生效，无需重启。
+#   sudo kill -SIGHUP $(pgrep -f ebpf_monitor.py)
+# ==============================================================================
+
+# -------------------------------------------------------------------
+# 版本与元数据
+# -------------------------------------------------------------------
+version: "1.0.0"
+description: "Runtime Guardian 检测规则配置"
+
+# ==============================================================================
+# sensitive_files — 敏感文件列表
+# ==============================================================================
+# eBPF 内核态 openat 探针直接匹配路径，命中即推送告警事件到用户态。
+# 支持精确路径、glob 通配符，以及按风险等级分级。
+sensitive_files:
+
+  # ---- 系统账户与认证 ----
+  - path: "/etc/passwd"
+    risk: high
+    category: "system_accounts"
+    description: "用户账户数据库"
+  - path: "/etc/shadow"
+    risk: critical
+    category: "system_accounts"
+    description: "用户密码哈希"
+  - path: "/etc/group"
+    risk: medium
+    category: "system_accounts"
+    description: "用户组数据库"
+  - path: "/etc/gshadow"
+    risk: high
+    category: "system_accounts"
+    description: "组密码哈希"
+
+  # ---- SSH 密钥与配置 ----
+  - path: "/root/.ssh/authorized_keys"
+    risk: critical
+    category: "ssh_keys"
+    description: "root SSH 公钥信任列表"
+  - path: "/root/.ssh/id_rsa"
+    risk: critical
+    category: "ssh_keys"
+    description: "root SSH 私钥"
+  - path: "/root/.ssh/id_ed25519"
+    risk: critical
+    category: "ssh_keys"
+    description: "root ED25519 私钥"
+  - path: "/home/*/.ssh/authorized_keys"
+    risk: high
+    category: "ssh_keys"
+    description: "用户 SSH 公钥信任列表（通配）"
+  - path: "/home/*/.ssh/id_*"
+    risk: high
+    category: "ssh_keys"
+    description: "用户 SSH 私钥（通配）"
+  - path: "/etc/ssh/sshd_config"
+    risk: medium
+    category: "ssh_config"
+    description: "SSH 服务端配置"
+
+  # ---- sudo 与权限提升 ----
+  - path: "/etc/sudoers"
+    risk: critical
+    category: "privilege_escalation"
+    description: "sudo 权限配置"
+  - path: "/etc/sudoers.d/*"
+    risk: critical
+    category: "privilege_escalation"
+    description: "sudo 扩展配置目录"
+
+  # ---- 系统配置与安全 ----
+  - path: "/etc/crontab"
+    risk: high
+    category: "persistence"
+    description: "系统级 crontab"
+  - path: "/var/spool/cron/crontabs/*"
+    risk: high
+    category: "persistence"
+    description: "用户 crontab 文件"
+  - path: "/etc/systemd/system/*"
+    risk: high
+    category: "persistence"
+    description: "systemd 服务定义"
+  - path: "/etc/init.d/*"
+    risk: medium
+    category: "persistence"
+    description: "SysV init 脚本"
+
+  # ---- 日志与审计证据 ----
+  - path: "/var/log/auth.log"
+    risk: medium
+    category: "anti_forensics"
+    description: "认证日志（可能被清除痕迹）"
+  - path: "/var/log/secure"
+    risk: medium
+    category: "anti_forensics"
+    description: "安全日志"
+  - path: "/var/log/syslog"
+    risk: low
+    category: "anti_forensics"
+    description: "系统日志"
+
+  # ---- TLS/SSL 证书与密钥 ----
+  - path: "/etc/ssl/private/*"
+    risk: critical
+    category: "ssl_keys"
+    description: "SSL/TLS 私钥目录"
+  - path: "/etc/nginx/ssl/*"
+    risk: high
+    category: "ssl_keys"
+    description: "Nginx SSL 证书/密钥"
+
+  # ---- 数据库凭据 ----
+  - path: "/root/.my.cnf"
+    risk: critical
+    category: "database_credentials"
+    description: "MySQL root 自动登录配置"
+  - path: "/root/.pgpass"
+    risk: critical
+    category: "database_credentials"
+    description: "PostgreSQL 密码文件"
+
+  # ---- 容器与云凭据 ----
+  - path: "/root/.docker/config.json"
+    risk: high
+    category: "container_credentials"
+    description: "Docker registry 凭据"
+  - path: "/root/.kube/config"
+    risk: high
+    category: "container_credentials"
+    description: "Kubernetes kubeconfig"
+  - path: "/root/.aws/credentials"
+    risk: critical
+    category: "cloud_credentials"
+    description: "AWS CLI 凭据"
+  - path: "/root/.config/gcloud/credentials.db"
+    risk: critical
+    category: "cloud_credentials"
+    description: "GCP CLI 凭据"
+
+# ==============================================================================
+# storm_threshold — 系统调用风暴阈值
+# ==============================================================================
+# eBPF 内核态使用 LRU map 计数每个 PID 的 open 调用频率；
+# 超过阈值则推送到用户态进行二次验证。
+storm_threshold:
+
+  # ---- 全局默认阈值 ----
+  default:
+    max_calls_per_second: 50      # 1 秒内 open 调用超过此数即标记可疑
+    window_seconds: 1             # 滑动窗口大小（秒）
+    burst_tolerance: 3            # 允许的连续突发窗口数（防误报）
+
+  # ---- 按进程个性化阈值 ----
+  per_process:
+    # 数据库等 IO 密集型进程可适当放宽
+    - process_pattern: "mysqld|postgres|mongod|redis-server"
+      max_calls_per_second: 200
+      description: "数据库进程允许更高 IO 频率"
+    # 编译工具链
+    - process_pattern: "gcc|g++|rustc|go|javac"
+      max_calls_per_second: 150
+      description: "编译过程会产生大量文件操作"
+    # 包管理器
+    - process_pattern: "dpkg|rpm|apt|yum|pip|npm"
+      max_calls_per_second: 300
+      description: "包管理操作涉及大量小文件读写"
+    # Web 服务器静态文件服务
+    - process_pattern: "nginx|apache2|httpd"
+      max_calls_per_second: 500
+      description: "Web 服务器高并发静态文件服务"
+
+  # ---- 风暴告警分级 ----
+  alert_levels:
+    - level: warning
+      min_rate: 50
+      max_rate: 100
+      message: "⚠ 系统调用频率升高，注意观察"
+    - level: alert
+      min_rate: 100
+      max_rate: 300
+      message: "🟠 检测到异常高频系统调用，疑似勒索软件扫描"
+    - level: critical
+      min_rate: 300
+      description: "🔴 严重系统调用风暴，极可能是攻击行为"
+
+# ==============================================================================
+# behavior_chains — 行为链检测规则
+# ==============================================================================
+# 用户态状态机为每个 PID 维护独立的行为序列缓冲区。
+# 当某 PID 的行为序列匹配以下任一链式规则时触发告警。
+behavior_chains:
+
+  # ---- 链1: 下载执行攻击 ----
+  - name: "download_and_execute"
+    risk: critical
+    description: "检测 wget/curl 下载后 chmod +x 并执行的行为链"
+    state_machine:
+      states: [IDLE, NETWORK_DOWNLOAD, FILE_WRITTEN, MADE_EXECUTABLE, EXECUTED]
+    sequence:
+      - step: 1
+        action: "network_download"
+        syscalls: ["connect", "sendto", "recvfrom"]
+        description: "进程发起网络连接并接收数据"
+        timeout_sec: 30
+      - step: 2
+        action: "file_created"
+        syscalls: ["openat", "creat"]
+        flags: ["O_CREAT", "O_WRONLY", "O_RDWR"]
+        description: "创建新文件用于写入"
+        within_sec: 5          # 必须在步骤1完成后5秒内发生
+      - step: 3
+        action: "data_written"
+        syscalls: ["write", "pwrite64"]
+        description: "向文件写入数据"
+        min_bytes: 1024         # 最小写入字节数（过滤小写操作）
+        within_sec: 10
+      - step: 4
+        action: "made_executable"
+        syscalls: ["chmod", "fchmod"]
+        mode_contains: "x"      # 权限位包含执行权限
+        within_sec: 5
+      - step: 5
+        action: "executed"
+        syscalls: ["execve"]
+        target_matches_downloaded: true  # execve 的目标必须是步骤2的文件
+        within_sec: 10
+
+  # ---- 链2: 反弹 Shell ----
+  - name: "reverse_shell"
+    risk: critical
+    description: "检测 bash/sh 的标准输入输出重定向到网络 socket"
+    state_machine:
+      states: [IDLE, SOCKET_CREATED, FD_DUPED, SHELL_EXEC]
+    sequence:
+      - step: 1
+        action: "create_socket"
+        syscalls: ["socket"]
+        domain: ["AF_INET", "AF_INET6"]
+        type: "SOCK_STREAM"
+      - step: 2
+        action: "connect_remote"
+        syscalls: ["connect"]
+        non_localhost: true      # 目标不是 127.0.0.1
+        within_sec: 10
+      - step: 3
+        action: "dup_stdio"
+        syscalls: ["dup2", "dup3"]
+        target_fds: [0, 1, 2]    # 重定向到 stdin/stdout/stderr
+        source_fd_is_socket: true
+        within_sec: 2
+      - step: 4
+        action: "exec_shell"
+        syscalls: ["execve"]
+        binary_matches: ["*/bash", "*/sh", "*/dash", "*/zsh", "*/python*"]
+        within_sec: 1
+
+  # ---- 链3: 权限提升探测 ----
+  - name: "privilege_escalation_probe"
+    risk: high
+    description: "检测连续尝试多种提权手法（SUID 查找 → 内核漏洞探测 → sudo 尝试）"
+    state_machine:
+      states: [IDLE, SUID_SEARCH, KERNEL_PROBE, SUDO_ATTEMPT]
+    sequence:
+      - step: 1
+        action: "find_suid"
+        syscalls: ["execve"]
+        cmdline_pattern: "(?i).*find.*-perm.*4000.*"
+        within_window_sec: 60
+      - step: 2
+        action: "kernel_version_probe"
+        syscalls: ["uname", "execve"]
+        cmdline_pattern: "(?i).*(uname -a|cat /proc/version|dmesg).*"
+        within_window_sec: 60
+      - step: 3
+        action: "sudo_attempt"
+        syscalls: ["execve"]
+        cmdline_pattern: "(?i).*sudo.*"
+        within_window_sec: 30
+
+  # ---- 链4: 数据渗出 ----
+  - name: "data_exfiltration"
+    risk: critical
+    description: "检测读取敏感文件后通过网络发送"
+    state_machine:
+      states: [IDLE, SENSITIVE_READ, NETWORK_SEND]
+    sequence:
+      - step: 1
+        action: "read_sensitive"
+        syscalls: ["openat", "read"]
+        path_in_sensitive_files: true
+        within_window_sec: 60
+      - step: 2
+        action: "network_send"
+        syscalls: ["sendto", "sendmsg", "write"]
+        fd_is_socket: true
+        large_transfer: true    # 大量数据传输
+        within_sec: 30
+
+  # ---- 链5: 容器逃逸 ----
+  - name: "container_escape"
+    risk: critical
+    description: "检测容器内进程尝试访问宿主机资源"
+    state_machine:
+      states: [IDLE, PROC_MOUNT, NS_ENTER]
+    sequence:
+      - step: 1
+        action: "detect_container"
+        metadata:
+          cgroup_contains: "docker|containerd|kubepods"
+      - step: 2
+        action: "access_host_fs"
+        syscalls: ["openat", "mount"]
+        paths: ["/proc/*/root", "/host", "/var/run/docker.sock"]
+        within_window_sec: 300
+      - step: 3
+        action: "nsenter_attempt"
+        syscalls: ["execve"]
+        cmdline_pattern: "(?i).*nsenter.*"
+        within_sec: 10
+
+# ==============================================================================
+# network — 网络异常检测参数
+# ==============================================================================
+network:
+
+  # ---- 连接频率 ----
+  connection_rate:
+    max_unique_ips_per_minute: 30     # 1分钟内连接的不同IP数上限
+    max_total_connections_per_minute: 200
+    alert_on_sustained: true          # 持续超阈值才告警（防短暂突发误报）
+    sustained_windows: 3              # 连续3个滑动窗口超阈值才告警
+
+  # ---- 端口扫描检测 ----
+  port_scan:
+    enabled: true
+    max_unique_ports_per_minute: 20   # 1分钟内目标端口数上限
+    window_seconds: 60
+    # HyperLogLog 近似参数（内存高效的大基数估计）
+    hyperloglog:
+      precision: 14                   # 寄存器位数（2^14 = 16384 个桶）
+      error_rate: 0.016               # 约 1.6% 误差，内存占用 ~12KB
+
+  # ---- 可疑目标 ----
+  suspicious_targets:
+    # 已知恶意 IP 范围/域名模式
+    - pattern: "*.onion"
+      description: "Tor 隐藏服务（高匿名性）"
+      risk: high
+    - pattern: "*.xyz|*.top|*.tk|*.ml|*.ga"
+      description: "高风险 TLD（常用于恶意软件 C2）"
+      risk: medium
+    # 非标准端口出站连接
+    non_standard_ports:
+      alert: true
+      whitelist: [80, 443, 22, 53, 123, 8080, 8443]
+
+  # ---- DNS 异常 ----
+  dns:
+    tunnel_detection:
+      enabled: true
+      max_query_length: 52            # 正常域名最长 253 字符，但单标签 ≤ 63
+      max_queries_per_domain_per_minute: 10
+      entropy_threshold: 4.5          # 域名香农熵过高 → 可能 DNS 隧道
+
+# ==============================================================================
+# baseline — 基线检测参数
+# ==============================================================================
+# 配合 baseline_detector.py 使用，自动学习进程正常行为模式。
+baseline:
+
+  # ---- 训练阶段 ----
+  training:
+    duration_minutes: 30              # 基线训练时长（）分钟正常行为
+    min_samples: 10000                # 最少系统调用样本数
+    exclude_initial_seconds: 60       # 排除进程启动后前 N 秒（初始化噪音）
+    retrain_interval_hours: 24        # 每隔 N 小时重新训练基线
+
+  # ---- 检测算法参数 ----
+  detection:
+    # z-score: 频率异常
+    zscore:
+      threshold: 3.0                  # |z| > 3 触发（正态分布中概率 < 0.3%）
+      window_seconds: 10              # 滑动窗口
+      min_observations: 30            # 最少观测次数（样本太少不做统计推断）
+
+    # n-gram: 序列异常
+    ngram:
+      n: 3                            # 三连语法（trigram）
+      perplexity_threshold: 2.0       # 困惑度相对基线升高超过 2 倍触发
+      max_patterns: 5000              # 最多存储的模式数（LRU 淘汰）
+
+    # 香农熵: 多样性异常
+    entropy:
+      baseline_window_seconds: 300    # 基线熵计算窗口（5 分钟）
+      detection_window_seconds: 30    # 检测时的窗口
+      deviation_threshold: 0.15       # 相对偏离超过 15% 触发
+
+    # 综合评分权重
+    score_weights:
+      zscore: 0.4                     # 频率异常权重 40%
+      ngram_perplexity: 0.35          # 序列异常权重 35%
+      entropy_deviation: 0.25         # 多样性异常权重 25%
+    composite_threshold: 0.7          # 加权总分 > 0.7 触发告警
+
+  # ---- EWMA 自适应 ----
+  ewma:
+    alpha: 0.05                       # 新数据权重（5% → 缓慢适应概念漂移）
+    update_interval_seconds: 60       # 每 60 秒更新一次基线
+    max_drift_per_update: 0.10        # 每次更新不超过 10%（防投毒）
+
+# ==============================================================================
+# response — 响应策略配置
+# ==============================================================================
+# 当检测到攻击行为时，按风险等级执行对应的自动响应。
+response:
+
+  # ---- 全局开关 ----
+  enabled: true                        # 是否启用自动响应
+  dry_run: false                       # true = 仅记录不执行（调试模式）
+
+  # ---- 按风险等级的响应动作 ----
+  levels:
+
+    - risk: critical
+      actions:
+        - action: "kill_process"
+          signal: "SIGKILL"
+          description: "立即终止攻击进程"
+        - action: "isolate_network"
+          method: "iptables"
+          rule: "iptables -A OUTPUT -m owner --pid-owner {pid} -j DROP"
+          description: "隔离进程网络（iptables 阻断出站）"
+        - action: "dump_memory"
+          path: "/var/log/runtime-guardian/dumps/{pid}_{timestamp}.mem"
+          description: "保存进程内存快照供取证"
+        - action: "alert"
+          level: "P0"
+          channels: ["log", "syslog", "webhook"]
+          webhook_url: "${WEBHOOK_CRITICAL_URL}"
+          description: "发送最高优先级告警"
+        - action: "quarantine"
+          method: "move_to_cgroup"
+          cgroup: "runtime-guardian-quarantine"
+          description: "将进程移入隔离 cgroup（限制 CPU/内存/IO）"
+      cooldown_seconds: 300            # 同类型告警冷却时间
+
+    - risk: high
+      actions:
+        - action: "kill_process"
+          signal: "SIGTERM"
+          graceful_timeout_sec: 5
+          description: "优雅终止进程（等待 5 秒后 SIGKILL）"
+        - action: "alert"
+          level: "P1"
+          channels: ["log", "syslog", "webhook"]
+          webhook_url: "${WEBHOOK_HIGH_URL}"
+        - action: "throttle_process"
+          method: "cpu_limit"
+          cpu_percent: 10
+          description: "限制进程 CPU 使用率至 10%"
+      cooldown_seconds: 120
+
+    - risk: medium
+      actions:
+        - action: "alert"
+          level: "P2"
+          channels: ["log", "syslog"]
+        - action: "log_evidence"
+          include: ["cmdline", "environ", "cwd", "open_fds", "network_connections"]
+          description: "记录详细证据快照"
+      cooldown_seconds: 60
+
+    - risk: low
+      actions:
+        - action: "log"
+          description: "仅记录日志，不主动干预"
+      cooldown_seconds: 30
+
+  # ---- 告警渠道配置 ----
+  alert_channels:
+    log:
+      path: "/var/log/runtime-guardian/alerts.log"
+      format: "json"
+      rotate:
+        max_size_mb: 100
+        max_files: 10
+    syslog:
+      facility: "local0"
+      tag: "runtime-guardian"
+    webhook:
+      timeout_seconds: 5
+      retries: 3
+      headers:
+        Content-Type: "application/json"
+
+  # ---- 全局冷却 ----
+  global_cooldown:
+    max_alerts_per_minute: 60          # 全局每分钟最多 60 条告警
+    dedup_window_seconds: 10           # 同一 PID+类型去重窗口
+
+# ==============================================================================
+# whitelist — 白名单配置
+# ==============================================================================
+# 白名单中的进程/路径/用户不会被触发告警。
+# 注意：白名单应尽量精确，避免过度放宽导致漏检。
+
+whitelist:
+
+  # ---- 进程白名单 ----
+  processes:
+    - name: "ebpf_monitor.py"
+      reason: "监控器自身进程，避免自指"
+    - name: "baseline_detector.py"
+      reason: "基线检测器自身进程"
+    - name: "systemd"
+      reason: "系统初始化进程，大量正常文件操作"
+    - name: "sshd"
+      reason: "SSH 服务进程，正常网络连接"
+    - name: "containerd"
+      reason: "容器运行时，正常高频率系统调用"
+    - name: "dockerd"
+      reason: "Docker 守护进程"
+
+  # ---- 路径白名单（敏感文件检测时不告警） ----
+  paths:
+    - pattern: "/proc/*/maps"
+      reason: "/proc 内存映射，正常进程信息读取"
+    - pattern: "/proc/*/status"
+      reason: "/proc 进程状态"
+    - pattern: "/sys/class/*"
+      reason: "sysfs 硬件信息"
+    - pattern: "/dev/null"
+      reason: "空设备"
+    - pattern: "/dev/urandom"
+      reason: "随机数设备"
+    - pattern: "/tmp/rg_*"
+      reason: "Runtime Guardian 自身测试/临时文件"
+
+  # ---- 用户白名单 ----
+  users:
+    - uid: 0
+      username: "root"
+      reason: "root 用户管理操作（仅在受控环境中）"
+      note: "⚠ 生产环境建议移除此条目"
+
+  # ---- 网络白名单 ----
+  network:
+    subnets:
+      - cidr: "10.0.0.0/8"
+        reason: "私有网络 A 类"
+      - cidr: "172.16.0.0/12"
+        reason: "私有网络 B 类"
+      - cidr: "192.168.0.0/16"
+        reason: "私有网络 C 类"
+      - cidr: "127.0.0.0/8"
+        reason: "本地回环"
+    domains:
+      - "*.ubuntu.com"
+      - "*.debian.org"
+      - "*.python.org"
+      - "*.pypi.org"
+      - "*.github.com"
+      reason: "系统更新与包管理常用域名"
+
+  # ---- 系统调用白名单（按进程） ----
+  syscall_whitelist:
+    - process_pattern: "nginx|apache2"
+      allowed_syscalls: ["epoll_wait", "epoll_ctl", "accept4", "setsockopt"]
+      reason: "Web 服务器正常网络系统调用"
+    - process_pattern: "mysqld|postgres"
+      allowed_syscalls: ["fsync", "fdatasync", "msync"]
+      reason: "数据库持久化必需的同步 IO"
+
+# ================================================================
+# 多用户行为基线配置（七维检测第5维）
+# ================================================================
+multi_user:
+  enabled: true
+
+  # 用户角色定义
+  # 不同 UID 有不同的"正常行为边界"
+  user_roles:
+    - uid: 0
+      role: "system_admin"
+      description: "root — 系统管理员"
+      # root 的正常高权限操作
+      allowed_high_risk_paths:
+        - "/etc/**"
+        - "/boot/**"
+        - "/usr/lib/systemd/**"
+      # root 也不能碰的路径
+      never_allowed:
+        - "/tmp/.X11-unix/*"
+
+    - uid: 33
+      role: "web_server"
+      description: "www-data — Web 服务器进程"
+      typical_paths:
+        - "/var/www/**"
+        - "/var/log/nginx/**"
+        - "/tmp/php*"
+      # www-data 绝对不能碰的
+      forbidden_paths:
+        - "/etc/shadow"
+        - "/etc/passwd"
+        - "/root/**"
+        - "/etc/ssl/private/**"
+      # www-data 正常的 syscall 频率范围（次/秒）
+      expected_syscall_rates:
+        openat: [0.5, 50]
+        read: [10, 5000]
+        write: [5, 2000]
+        connect: [0, 10]
+
+    - uid: 1000
+      role: "developer"
+      description: "普通开发者"
+      typical_paths:
+        - "/home/**"
+        - "/tmp/**"
+        - "/usr/local/**"
+
+  # 未知用户惩罚
+  unknown_user_penalty: 2.0  # 从未见过的 UID → 基础异常分
+
+  # 跨用户异常：A 用户做了 B 用户才会做的事
+  cross_user_rules:
+    - rule: "web_server_accessing_sysconfig"
+      description: "Web 服务器进程访问系统配置"
+      source_uid: 33
+      target_paths: ["/etc/**", "/boot/**"]
+      severity: "critical"
+
+    - rule: "developer_accessing_ssl_keys"
+      source_uid: 1000
+      target_paths: ["/etc/ssl/private/**"]
+      severity: "high"
+
+# ================================================================
+# 文件上下文感知配置（七维检测第6维）
+# ================================================================
+file_context:
+  enabled: true
+
+  # 路径分类规则（按优先级排序）
+  path_categories:
+    - prefix: "/etc/"
+      category: "SYSCONFIG"
+      risk_level: 10
+      description: "系统配置目录 — 最高敏感级别"
+
+    - prefix: "/etc/ssl/private/"
+      category: "SSL_KEY"
+      risk_level: 10
+
+    - prefix: "/root/.ssh/"
+      category: "SSH_KEY"
+      risk_level: 10
+
+    - prefix: "/boot/"
+      category: "BOOT"
+      risk_level: 10
+
+    - prefix: "/tmp/"
+      category: "TEMP"
+      risk_level: 8
+      description: "临时目录 — 常见攻击载体"
+      # 临时目录的异常模式
+      anomaly_patterns:
+        - "executable_in_temp"  # 从 /tmp 执行文件
+        - "hidden_file"          # . 开头的隐藏文件
+
+    - prefix: "/dev/shm/"
+      category: "SHARED_MEM"
+      risk_level: 9
+
+    - prefix: "/home/"
+      category: "USER_HOME"
+      risk_level: 8
+
+    - prefix: "/var/www/"
+      category: "WEB_ROOT"
+      risk_level: 7
+
+    - prefix: "/var/log/"
+      category: "LOG"
+      risk_level: 5
+
+    - prefix: "/proc/"
+      category: "PROCFS"
+      risk_level: 6
+
+    - prefix: "/sys/"
+      category: "SYSFS"
+      risk_level: 6
+
+    - prefix: "/dev/"
+      category: "DEVICE"
+      risk_level: 9
+
+    - prefix: "/usr/lib/"
+      category: "LIBRARY"
+      risk_level: 2
+
+    - prefix: "/usr/bin/"
+      category: "BINARY"
+      risk_level: 3
+
+    - prefix: "/var/run/"
+      category: "RUNTIME"
+      risk_level: 4
+
+    - prefix: "/var/lib/"
+      category: "DATA"
+      risk_level: 4
+
+  # 文件上下文异常规则
+  context_rules:
+    - rule: "web_user_in_sysconfig"
+      description: "非特权用户操作系统配置"
+      condition: "uid != 0 AND category IN [SYSCONFIG, SSL_KEY, SSH_KEY, BOOT]"
+      score_boost: 3.0
+
+    - rule: "root_in_temp_exec"
+      description: "root 从临时目录执行文件"
+      condition: "uid == 0 AND category == TEMP AND syscall == execve"
+      score_boost: 4.0
+
+    - rule: "log_tampering"
+      description: "修改或删除日志文件"
+      condition: "category == LOG AND syscall IN [unlink, rename, truncate]"
+      score_boost: 3.5
+
+# ================================================================
+# 时间分段基线配置（七维检测第7维）
+# ================================================================
+time_window:
+  enabled: true
+
+  # 时段定义
+  buckets:
+    - name: "NIGHT"
+      hours: [0, 1, 2, 3, 4, 5]
+      description: "深夜 — 流量最低，任何异常活动高度可疑"
+      baseline_multiplier: 0.1  # 正常频率仅为全天均值的 10%
+
+    - name: "MORNING"
+      hours: [6, 7, 8]
+      description: "早晨 — 系统启动和用户登录高峰期"
+      baseline_multiplier: 0.8
+
+    - name: "BUSINESS"
+      hours: [9, 10, 11]
+      description: "上午 — 正常工作时间"
+      baseline_multiplier: 1.0
+
+    - name: "AFTERNOON"
+      hours: [12, 13, 14]
+      description: "下午 — 包含午休时段"
+      baseline_multiplier: 0.9
+
+    - name: "PEAK"
+      hours: [15, 16, 17]
+      description: "高峰 — 全天流量最高"
+      baseline_multiplier: 1.2
+
+    - name: "EVENING"
+      hours: [18, 19, 20]
+      description: "晚间 — 流量逐步下降"
+      baseline_multiplier: 0.6
+
+    - name: "NIGHT_2"
+      hours: [21, 22, 23]
+      description: "夜间 — 仅维护任务运行"
+      baseline_multiplier: 0.2
+
+  # 跨时段异常规则
+  time_rules:
+    - rule: "night_admin_activity"
+      description: "NIGHT 时段出现大量系统管理操作"
+      condition: "bucket == NIGHT AND category == SYSCONFIG AND rate > 5x_baseline"
+      score_boost: 3.0
+
+    - rule: "night_network_spike"
+      description: "NIGHT 时段网络连接异常增多"
+      condition: "bucket IN [NIGHT, NIGHT_2] AND syscall == connect AND rate > 10x_baseline"
+      score_boost: 4.0
