@@ -1,3 +1,5 @@
+# Memory Entity Protocol 
+[![license](https://img.shields.io/badge/License-Apache%202.0-blue.svg
 #全新升级
 # 本项目旨在解决用户在进行后端调试或omo不知道程序状态。本项目可以打开另一个终端运行监测程序。输出简化错误
 # 再打开一个终端可查看日志。本产品支持训练。watchdog还可以在崩溃时重新启动。七维防护。还有更多场景待用户探索。
